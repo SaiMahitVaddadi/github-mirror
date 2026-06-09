@@ -43,7 +43,10 @@ mk_repo() {
   git -C "$dir" init -q -b main
   git -C "$dir" config user.email "test@example.com"
   git -C "$dir" config user.name  "test"
-  [[ -n "$url" ]] && git -C "$dir" remote add origin "$url"
+  if [[ -n "$url" ]]; then
+    git -C "$dir" remote add origin "$url"
+  fi
+  return 0
 }
 
 mk_repo "$TMP_REPOS/ours-repo"     "https://github.com/$PRIMARY/ours-repo.git"

@@ -51,12 +51,47 @@ mirror new my-repo --private           # create on BOTH accounts; clone with fan
 mirror clone owner/some-repo           # gh clone; wire fan-out push so future pushes go to both
 mirror adopt                           # inside an existing repo, add the other account as a push target
 mirror push                            # convenience wrapper; same as `git push`
+mirror audit                           # walk ~/Documents/Github + ~/coding-agents, classify every .git
+mirror audit --apply                   # ...and claim every not-ours repo onto both accounts
 mirror reconcile                       # create missing repos on either side, push their refs
 mirror reconcile --force               # also overwrite divergent histories (primary wins)
 mirror watch                           # run reconcile every reconcile_interval_min
 mirror install-launchd                 # macOS only: register hourly launchd job
 mirror uninstall-launchd
 ```
+
+## Audit + claim
+
+`mirror audit` walks a list of paths (default `~/Documents/Github` and `~/coding-agents`), finds every `.git` directory, reads its `origin` remote, and classifies it:
+
+- **ours** — origin points at `$PRIMARY` or `$MIRROR`.
+- **external** — origin points at github.com but a different owner (open-source clones, work repos, etc.).
+- **other** — origin is non-GitHub (GitLab, Bitbucket, self-hosted).
+- **none** — no `origin` remote configured.
+
+Output goes to stdout as TSV; summary tallies go to stderr — `mirror audit | grep external` works.
+
+### Flags
+
+- `--apply` — for every not-ours repo, create it on `$PRIMARY` and `$MIRROR`, wire the fan-out push, and push current `HEAD` (plus tags). Idempotent: re-running re-wires the remote and re-pushes.
+- `--dry-run` — with `--apply`, print what would be claimed without calling the API.
+- `--no-nested` — skip repos that live inside another already-counted repo (e.g. `node_modules/<pkg>/.git`).
+- `--ignore <glob>` — skip paths matching a glob. Can be passed multiple times. Tilde is expanded.
+- `--resume-from <path>` — with `--apply`, skip every repo up to and including `<path>`. Progress is written to `$STATE_DIR/audit.progress` after each apply, so you can grab the last `ok` line and resume after a crash.
+
+### What `--apply` does on a not-ours repo
+
+1. **Sanitize the directory's basename** into a GitHub-legal repo name. Strips leading `.`, `-`, `_` (GitHub rejects names starting with any of these), collapses disallowed chars to `-`, caps at 100 chars. Names that sanitize to empty (`..`, `___`) are skipped with a log line.
+2. **Rename the previous `origin` to `upstream`** so you can still fetch from where the code came from. If `upstream` already exists, falls back to `claimed-origin-N` — the original URL is never silently dropped.
+3. **Create the repo on `$PRIMARY` then `$MIRROR`**. If `$PRIMARY` create fails, abort before touching `$MIRROR`. If `$PRIMARY` succeeds but `$MIRROR` fails (rate limit, name collision), the run aborts with a clear log line — the `$PRIMARY` repo is left in place, since this tool doesn't request `delete_repo` scope. Re-run after fixing the cause.
+4. **Wire the fan-out push** on `origin` (both URLs).
+5. **Push current HEAD + tags** to both URLs, using per-account tokens fetched fresh from `gh auth token --user <acct>`. **Tokens are embedded into the push URL only for the duration of the single `git push` invocation** — they are never written to `.git/config`. All output from the `git push` (including stderr, which is where git echoes the URL on failure) is piped through a token-stripping filter that replaces the token with `***` before it reaches the terminal or log.
+
+### Caveats
+
+- If a repo has no commits yet, the two GitHub repos are still created (empty); you'll see a log line telling you to push manually once you have a commit. (There's no rollback because this tool doesn't request `delete_repo` scope.)
+- `find` is run with stderr captured; if any paths under the audit roots were unreadable, the summary prints a warning naming the first few — no permission errors silently swallow repos.
+- Token redaction uses an `awk` literal-string replace rather than `sed`, because tokens may contain characters that are metacharacters in sed (`|`, `/`, `&`). If the token is empty (`gh auth token` returned nothing), the redaction is a no-op `cat` — but the call sites refuse to push in that case, so the empty token is never embedded into a URL.
 
 ## How fan-out push works
 

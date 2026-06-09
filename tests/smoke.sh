@@ -62,3 +62,11 @@ parse_github_url "git@github.com:alice/my.cool.repo.git" o n
 pass "parse_github_url"
 
 echo "all smoke checks passed"
+
+# 7. Run the audit smoke suite if present (lives in its own file so it can
+#    stand up an isolated XDG_CONFIG_HOME + fake .git tree without
+#    interfering with the assertions above).
+if [[ -x "$ROOT/tests/audit_smoke.sh" ]]; then
+  echo
+  bash "$ROOT/tests/audit_smoke.sh" || fail "audit_smoke.sh failed"
+fi
