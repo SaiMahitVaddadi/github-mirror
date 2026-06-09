@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+# github-mirror — keep two GitHub accounts in sync.
+#
+# Two layers:
+#   1. Fan-out push  — `git push origin` writes to BOTH accounts.
+#                      Implemented via `git remote set-url --add --push`.
+#   2. Reconciler    — `mirror reconcile` walks both accounts and ensures
+#                      every repo exists on both, with current branches
+#                      pushed. Safe by default; needs `--force` to
+#                      overwrite divergent history.
+#
+# State: $HOME/.config/github-mirror/config.json
+# Dependencies: gh, git, jq. Bash 4+. macOS or Linux.
+
+set -euo pipefail
+
+# ── paths ────────────────────────────────────────────────────────────────────
+SELF="$(command -v "$0" || echo "$0")"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+REPO_DIR="$(cd "$SELF_DIR/.." && pwd)"
+LIB_DIR="$REPO_DIR/lib"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/github-mirror"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/github-mirror"
+LOG_FILE="$STATE_DIR/mirror.log"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+# shellcheck source=../lib/_common.sh
+source "$LIB_DIR/_common.sh"
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+cmd_init() {
+  require_cmd gh git jq
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+
+  # Detect accounts that gh knows about.
+  local accounts
+  accounts=$(gh auth status 2>&1 | awk '/account /{for(i=1;i<=NF;i++) if ($i=="account") print $(i+1)}' | sort -u)
+  if [[ -z "$accounts" ]]; then
+    die "no gh accounts found — run 'gh auth login' first"
+  fi
+  local acct_array=()
+  while IFS= read -r line; do acct_array+=("$line"); done <<<"$accounts"
+  if (( ${#acct_array[@]} < 2 )); then
+    die "found only ${#acct_array[@]} account(s); github-mirror needs at least 2 (gh auth login --git-protocol https for the second)"
+  fi
+
+  local primary mirror
+  if [[ -n "${MIRROR_PRIMARY:-}" ]]; then
+    primary="$MIRROR_PRIMARY"
+    # Validate that MIRROR_PRIMARY actually matches an authed account.
+    local found=0
+    for a in "${acct_array[@]}"; do [[ "$a" == "$primary" ]] && found=1; done
+    (( found )) || die "MIRROR_PRIMARY='$primary' is not among authenticated accounts: ${acct_array[*]}"
+  else
+    echo "Detected accounts:"
+    local i=1
+    for a in "${acct_array[@]}"; do echo "  $i) $a"; ((i++)); done
+    printf "Choose primary (1-%d): " "${#acct_array[@]}"
+    local pick
+    read -r pick
+    [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#acct_array[@]} )) \
+      || die "invalid choice: '$pick'"
+    primary="${acct_array[$((pick-1))]}"
+  fi
+
+  # Mirror = first account that isn't primary.
+  for a in "${acct_array[@]}"; do
+    if [[ "$a" != "$primary" ]]; then mirror="$a"; break; fi
+  done
+
+  jq -n \
+    --arg primary "$primary" \
+    --arg mirror "$mirror" \
+    --argjson all "$(printf '%s\n' "${acct_array[@]}" | jq -R . | jq -s .)" \
+    '{
+      primary: $primary,
+      mirror: $mirror,
+      accounts: $all,
+      default_visibility: "private",
+      reconcile_interval_min: 60,
+      ignore: []
+    }' > "$CONFIG_FILE"
+
+  echo "Wrote $CONFIG_FILE"
+  echo "  primary: $primary"
+  echo "  mirror:  $mirror"
+}
+
+cmd_status() {
+  load_config
+  require_cmd gh jq
+
+  local pjson mjson
+  pjson=$(gh_list_repos "$PRIMARY")
+  mjson=$(gh_list_repos "$MIRROR")
+
+  jq -nr \
+    --argjson p "$pjson" \
+    --argjson m "$mjson" \
+    --arg pname "$PRIMARY" \
+    --arg mname "$MIRROR" '
+    def by_name(a): a | map({(.name): .}) | add // {};
+    (by_name($p)) as $P |
+    (by_name($m)) as $M |
+    ($P | keys) + ($M | keys) | unique | map({
+      name: .,
+      primary: ($P[.] != null),
+      mirror:  ($M[.] != null),
+      primary_pushed_at: ($P[.].pushedAt // null),
+      mirror_pushed_at:  ($M[.].pushedAt // null),
+    })
+    | sort_by(.name)
+    | (["NAME", $pname, $mname, "P_PUSHED", "M_PUSHED"], (.[] | [
+        .name,
+        (if .primary then "✓" else "·" end),
+        (if .mirror  then "✓" else "·" end),
+        (.primary_pushed_at // "—"),
+        (.mirror_pushed_at  // "—")
+      ])) | @tsv
+    ' | column -t -s $'\t'
+}
+
+cmd_new() {
+  load_config
+  require_cmd gh git
+  local name="" visibility="" desc=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --public)  visibility="public"; shift ;;
+      --private) visibility="private"; shift ;;
+      --desc)    desc="$2"; shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: mirror new <repo-name> [--private|--public] [--desc <text>]"
+  visibility="${visibility:-$DEFAULT_VIS}"
+
+  # Create on both accounts. `gh repo create` requires the active acct, so
+  # switch, create, switch.
+  gh_create_repo "$PRIMARY" "$name" "$visibility" "$desc"
+  gh_create_repo "$MIRROR"  "$name" "$visibility" "$desc"
+
+  # Clone primary and wire fan-out push.
+  local clone_dir="$PWD/$name"
+  if [[ -e "$clone_dir" ]]; then
+    log "directory '$name' already exists — skipping clone"
+  else
+    git_with_account "$PRIMARY" clone "https://github.com/$PRIMARY/$name.git" "$clone_dir"
+  fi
+
+  (cd "$clone_dir" && setup_fanout_remote "$PRIMARY" "$MIRROR" "$name")
+  echo "Created $name on both accounts; cloned to $clone_dir with fan-out push wired."
+}
+
+cmd_adopt() {
+  load_config
+  require_cmd gh git jq
+  local path="${1:-$PWD}"
+  cd "$path"
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repo: $path"
+
+  local origin
+  origin=$(git remote get-url origin 2>/dev/null) || die "repo has no 'origin' remote"
+
+  local owner name
+  parse_github_url "$origin" owner name
+  [[ -n "$owner" && -n "$name" ]] || die "origin doesn't look like a GitHub URL: $origin"
+
+  local other
+  if [[ "$owner" == "$PRIMARY" ]]; then other="$MIRROR"
+  elif [[ "$owner" == "$MIRROR" ]]; then other="$PRIMARY"
+  else die "origin owner '$owner' is neither primary ($PRIMARY) nor mirror ($MIRROR); refusing to adopt"
+  fi
+
+  # Ensure the repo exists on the other account.
+  if ! gh_repo_exists "$other" "$name"; then
+    log "creating $other/$name (mirror of $owner/$name)"
+    local vis
+    vis=$(gh_repo_visibility "$owner" "$name")
+    gh_create_repo "$other" "$name" "${vis:-$DEFAULT_VIS}" "mirror of github.com/$owner/$name"
+  fi
+
+  setup_fanout_remote "$owner" "$other" "$name"
+  echo "Adopted: origin pushes to both $owner/$name and $other/$name"
+}
+
+cmd_push() {
+  load_config
+  require_cmd git
+  git push "$@"
+}
+
+cmd_reconcile() {
+  load_config
+  require_cmd gh git jq
+  local force=0 dry=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --force)   force=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  log "reconcile start primary=$PRIMARY mirror=$MIRROR force=$force dry=$dry"
+
+  local pjson mjson
+  pjson=$(gh_list_repos "$PRIMARY")
+  mjson=$(gh_list_repos "$MIRROR")
+
+  # Repos on primary but not on mirror → create + push.
+  mapfile -t missing_on_mirror < <(
+    jq -r --argjson m "$mjson" '
+      ($m | map(.name)) as $names |
+      .[] | select(.name as $n | $names | index($n) | not) | .name
+    ' <<<"$pjson"
+  )
+  mapfile -t missing_on_primary < <(
+    jq -r --argjson p "$pjson" '
+      ($p | map(.name)) as $names |
+      .[] | select(.name as $n | $names | index($n) | not) | .name
+    ' <<<"$mjson"
+  )
+
+  for name in "${missing_on_mirror[@]}"; do
+    is_ignored "$name" && { log "skip ignored $name"; continue; }
+    log "missing on mirror: $name"
+    (( dry )) && continue
+    reconcile_one "$PRIMARY" "$MIRROR" "$name" "$force"
+  done
+  for name in "${missing_on_primary[@]}"; do
+    is_ignored "$name" && { log "skip ignored $name"; continue; }
+    log "missing on primary: $name"
+    (( dry )) && continue
+    reconcile_one "$MIRROR" "$PRIMARY" "$name" "$force"
+  done
+
+  # Repos on both → compare default-branch head SHAs. Only sync when one side
+  # cleanly fast-forwards from the other; otherwise warn unless --force.
+  mapfile -t common_repos < <(
+    jq -nr --argjson p "$pjson" --argjson m "$mjson" '
+      ($p | map(.name)) as $pn |
+      ($m | map(.name)) as $mn |
+      ($pn | map(select(. as $x | $mn | index($x))))[]
+    '
+  )
+  for name in "${common_repos[@]}"; do
+    is_ignored "$name" && continue
+    sync_common "$name" "$force" "$dry"
+  done
+
+  log "reconcile done"
+}
+
+cmd_watch() {
+  load_config
+  require_cmd gh git jq
+  local interval
+  interval=$(jq -r '.reconcile_interval_min' "$CONFIG_FILE")
+  interval=$(( interval > 0 ? interval : 60 ))
+  log "watch: every ${interval}m"
+  while true; do
+    cmd_reconcile || log "reconcile cycle failed (continuing)"
+    sleep $(( interval * 60 ))
+  done
+}
+
+cmd_install_launchd() {
+  load_config
+  local plist="$HOME/Library/LaunchAgents/com.github-mirror.reconcile.plist"
+  local template="$REPO_DIR/launchd/com.github-mirror.reconcile.plist.template"
+  mkdir -p "$(dirname "$plist")"
+  # Capture the user's interactive PATH so the job finds gh/git/jq wherever
+  # they live (Homebrew Intel, Apple Silicon, asdf, ~/.local/bin, etc.).
+  # Fall back to the current PATH if the login-shell trick fails.
+  local user_path
+  user_path=$("${SHELL:-/bin/zsh}" -ilc 'printf %s "$PATH"' 2>/dev/null) || user_path=""
+  : "${user_path:=$PATH}"
+  sed -e "s|@MIRROR_BIN@|$SELF|g" \
+      -e "s|@LOG_FILE@|$LOG_FILE|g" \
+      -e "s|@PATH@|$user_path|g" \
+      "$template" > "$plist"
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load "$plist"
+  echo "Installed launchd job at $plist (runs reconcile every hour)"
+}
+
+cmd_uninstall_launchd() {
+  local plist="$HOME/Library/LaunchAgents/com.github-mirror.reconcile.plist"
+  if [[ -f "$plist" ]]; then
+    launchctl unload "$plist" 2>/dev/null || true
+    rm "$plist"
+    echo "Removed $plist"
+  else
+    echo "No launchd job installed."
+  fi
+}
+
+cmd_clone() {
+  load_config
+  require_cmd gh git
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "usage: mirror clone <owner>/<repo> [dir]"
+  local dir="${2:-}"
+  gh repo clone "$target" ${dir:+"$dir"} -- --quiet
+  local repo_dir="${dir:-${target##*/}}"
+  cmd_adopt "$repo_dir"
+}
+
+cmd_audit() {
+  load_config
+  require_cmd git jq
+  local apply=0 dry=0 no_nested=0 resume_from=""
+  local -a paths=() ignore_patterns=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --apply)        apply=1; shift ;;
+      --dry-run)      dry=1; shift ;;
+      --no-nested)    no_nested=1; shift ;;
+      --resume-from)  resume_from="$2"; shift 2 ;;
+      --ignore)
+        # Expand leading ~ here — the shell can't, because the value is
+        # quoted into an array element.
+        local pat="$2"
+        [[ "$pat" == "~"* ]] && pat="$HOME${pat:1}"
+        ignore_patterns+=("$pat"); shift 2 ;;
+      -*) die "unknown flag: $1" ;;
+      *)  paths+=("$1"); shift ;;
+    esac
+  done
+  (( ${#paths[@]} > 0 )) || paths=("$HOME/Documents/Github" "$HOME/coding-agents")
+
+  # Drop paths that don't exist so `find` doesn't error out the whole run.
+  local -a real_paths=()
+  for p in "${paths[@]}"; do
+    if [[ -d "$p" ]]; then
+      real_paths+=("$p")
+    else
+      >&2 echo "warning: skipping missing path: $p"
+    fi
+  done
+  (( ${#real_paths[@]} > 0 )) || die "no readable paths to audit"
+
+  # Capture find's stderr to a tempfile so permission errors aren't silent.
+  local find_err
+  find_err=$(mktemp -t mirror-audit-err.XXXXXX)
+  # shellcheck disable=SC2064
+  trap "rm -f '$find_err'" RETURN
+
+  # Header
+  printf '%s\n' "STATUS	ACCT	LOCAL_PATH	ORIGIN_URL"
+
+  local total=0 ours=0 external=0 other=0 none=0
+  local -a applies=()
+  # Track seen repos so we can implement --no-nested (skip .git found
+  # under an already-claimed repo dir).
+  local -a seen_roots=()
+  while IFS= read -r gitdir; do
+    [[ -n "$gitdir" ]] || continue
+    # Declare ALL loop-scope locals up front — `set -u` will trip on
+    # parse_github_url's printf -v target if owner/name aren't already
+    # bound (dynamic scope walks up looking for them).
+    local repo_dir="" status="" acct="" origin="" owner="" name=""
+    repo_dir="$(dirname "$gitdir")"
+
+    # --no-nested: if this repo lives inside one we already counted, skip.
+    if (( no_nested )); then
+      local nested=0
+      for root in "${seen_roots[@]}"; do
+        if [[ "$repo_dir" == "$root"/* ]]; then nested=1; break; fi
+      done
+      (( nested )) && continue
+    fi
+
+    # Skip ignored patterns (glob match against the path)
+    local skip=0
+    for pat in "${ignore_patterns[@]}"; do
+      # shellcheck disable=SC2053
+      [[ "$repo_dir" == $pat ]] && { skip=1; break; }
+    done
+    (( skip )) && continue
+
+    seen_roots+=("$repo_dir")
+    ((total++))
+
+    origin=$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)
+    if [[ -z "$origin" ]]; then
+      status="none"; acct="—"; origin="(no origin)"
+      ((none++))
+    else
+      parse_github_url "$origin" owner name
+      if [[ -z "$owner" ]]; then
+        status="other"; acct="—"
+        ((other++))
+      elif [[ "$owner" == "$PRIMARY" || "$owner" == "$MIRROR" ]]; then
+        status="ours"; acct="$owner"
+        ((ours++))
+      else
+        status="external"; acct="$owner"
+        ((external++))
+      fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$status" "$acct" "$repo_dir" "$origin"
+
+    # Queue for apply if it's not already ours.
+    if (( apply )) && [[ "$status" != "ours" ]]; then
+      applies+=("$repo_dir")
+    fi
+  done < <(find "${real_paths[@]}" -name .git -type d -prune 2>"$find_err")
+
+  >&2 echo
+  >&2 echo "── summary ──"
+  >&2 echo "  total:     $total"
+  >&2 echo "  ours:      $ours"
+  >&2 echo "  external:  $external"
+  >&2 echo "  other:     $other"
+  >&2 echo "  no origin: $none"
+
+  if [[ -s "$find_err" ]]; then
+    local err_lines
+    err_lines=$(wc -l <"$find_err" | tr -d ' ')
+    >&2 echo
+    >&2 echo "warning: find reported $err_lines unreadable path(s) — some repos may be missing"
+    >&2 echo "  first few:"
+    >&2 head -5 "$find_err" | sed 's/^/    /' >&2
+  fi
+
+  if (( apply )); then
+    >&2 echo
+    >&2 echo "── apply: ${#applies[@]} repos to claim ──"
+    mkdir -p "$STATE_DIR"
+    local progress_file="$STATE_DIR/audit.progress"
+    : > "$progress_file.tmp" 2>/dev/null || true
+
+    # --resume-from <path>: skip everything up to and including the given path.
+    local resumed=0
+    if [[ -n "$resume_from" ]]; then
+      resumed=1
+      >&2 echo "  resuming after: $resume_from"
+    fi
+
+    local i=0
+    for d in "${applies[@]}"; do
+      ((i++))
+      if (( resumed )); then
+        if [[ "$d" == "$resume_from" ]]; then resumed=0; fi
+        >&2 echo "[$i/${#applies[@]}] skip (resume): $d"
+        continue
+      fi
+      >&2 echo "[$i/${#applies[@]}] $d"
+      if (( dry )); then continue; fi
+      if claim_local_repo "$d"; then
+        printf 'ok\t%s\n'   "$d" >> "$progress_file"
+      else
+        >&2 echo "  failed: $d"
+        printf 'fail\t%s\n' "$d" >> "$progress_file"
+      fi
+    done
+    >&2 echo
+    >&2 echo "  progress log: $progress_file"
+    >&2 echo "  to resume after a crash:  mirror audit --apply --resume-from <last-ok-path>"
+  fi
+}
+
+cmd_help() {
+  cat <<EOF
+github-mirror — keep two GitHub accounts in sync.
+
+USAGE
+  mirror <command> [args]
+
+COMMANDS
+  init                       Interactive one-time setup (picks primary + mirror).
+  status                     List every repo on both accounts, mark presence.
+  new <name> [--public]      Create the repo on both accounts; clone with fan-out push.
+  adopt [<path>]             Wire fan-out push for an existing local repo.
+  clone <owner>/<repo>       gh repo clone, then adopt.
+  audit [<path>...] [--apply] [--dry-run] [--no-nested]
+        [--ignore <glob>] [--resume-from <path>]
+                             Walk paths (default: ~/Documents/Github + ~/coding-agents),
+                             find every .git repo, and classify origin as ours
+                             (PRIMARY or MIRROR), external (other GitHub user),
+                             other (non-GitHub), or none. With --apply, every
+                             not-ours repo is claimed: created on both accounts,
+                             current HEAD pushed, previous origin renamed to
+                             'upstream' (or 'claimed-origin-N' if 'upstream'
+                             already exists) so the original source is still
+                             reachable. --no-nested skips repos that live
+                             inside another repo. --resume-from <path> skips
+                             everything up to and including <path>, for
+                             restarting after a crash; see audit.progress in
+                             $STATE_DIR.
+  push [<git-args>]          Wrapper around git push (origin already fans out).
+  reconcile [--force] [--dry-run]
+                             Walk both accounts; create + push missing repos.
+                             Without --force, divergent histories are reported, not
+                             overwritten.
+  watch                      Loop reconcile every reconcile_interval_min.
+  install-launchd            Register a hourly launchd job (macOS) that runs reconcile.
+  uninstall-launchd          Remove that job.
+  help                       This text.
+
+CONFIG  $CONFIG_FILE
+STATE   $STATE_DIR
+LOG     $LOG_FILE
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    init|status|new|adopt|push|reconcile|watch|clone|audit|help)
+      "cmd_$cmd" "$@" ;;
+    install-launchd)   cmd_install_launchd "$@" ;;
+    uninstall-launchd) cmd_uninstall_launchd "$@" ;;
+    -h|--help) cmd_help ;;
+    *) die "unknown command: $cmd (run 'mirror help')" ;;
+  esac
+}
+
+main "$@"

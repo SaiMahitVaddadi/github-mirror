@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github-mirror.reconcile</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@MIRROR_BIN@</string>
+    <string>reconcile</string>
+  </array>
+
+  <!-- Runs once per hour. -->
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>@LOG_FILE@</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG_FILE@</string>
+
+  <!-- Bring in the user's interactive $PATH so gh, git, jq resolve
+       wherever they live (Homebrew Intel/ARM, asdf, ~/.local/bin, etc.).
+       install-launchd substitutes @PATH@ at write time. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@PATH@</string>
+  </dict>
+</dict>
+</plist>
